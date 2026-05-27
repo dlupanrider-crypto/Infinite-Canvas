@@ -31,7 +31,7 @@ May 25th Update:
 
 --------
 
-禁止商业用途
+已经申请著作权，禁止商业用途
 
 Commercial use is prohibited.
 
