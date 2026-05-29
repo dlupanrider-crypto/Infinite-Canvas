@@ -1108,7 +1108,15 @@ def static_html_response(filename: str):
         headers={"Cache-Control": "no-cache"},
     )
 
-PROMPT_TEMPLATE_MD = os.path.join(BASE_DIR, "功能点", "无限画布_预设提示词标准库_v2.0.md")
+STATIC_PROMPT_TEMPLATE_MD = os.path.join(STATIC_DIR, "system-prompts", "infinite-canvas-prompt-templates.md")
+LEGACY_PROMPT_TEMPLATE_MD = os.path.join(BASE_DIR, "功能点", "无限画布_预设提示词标准库_v2.0.md")
+PROMPT_TEMPLATE_PATHS = [STATIC_PROMPT_TEMPLATE_MD, LEGACY_PROMPT_TEMPLATE_MD]
+
+def prompt_template_markdown_path() -> str:
+    for path in PROMPT_TEMPLATE_PATHS:
+        if os.path.exists(path):
+            return path
+    return ""
 
 def prompt_template_category(name: str, scene: str) -> str:
     text = f"{name} {scene}"
@@ -1169,6 +1177,52 @@ def app_info():
         "version": version,
         "repo_url": GITHUB_REPO_URL,
         "version_url": GITHUB_VERSION_URL,
+        "tree_url": GITHUB_TREE_URL,
+    }
+
+def connectivity_probe(name: str, url: str, timeout: float = 8.0) -> Dict[str, Any]:
+    started = time.time()
+    item = {
+        "name": name,
+        "url": url,
+        "ok": False,
+        "status": 0,
+        "elapsed_ms": 0,
+        "error": "",
+    }
+    try:
+        response = requests.get(
+            url,
+            headers={"User-Agent": "Infinite-Canvas-Updater"},
+            timeout=timeout,
+            stream=True,
+            proxies=urllib.request.getproxies() or None,
+        )
+        item["status"] = response.status_code
+        item["ok"] = 200 <= response.status_code < 400
+        if not item["ok"]:
+            item["error"] = f"HTTP {response.status_code} {response.reason}"
+        response.close()
+    except requests.RequestException as exc:
+        item["error"] = str(exc)
+    finally:
+        item["elapsed_ms"] = int((time.time() - started) * 1000)
+    return item
+
+@app.get("/api/update-connectivity")
+def update_connectivity():
+    targets = [
+        ("GitHub 更新列表", GITHUB_TREE_URL),
+        ("GitHub 版本文件", GITHUB_VERSION_URL),
+        ("GitHub 主页", "https://github.com/"),
+        ("Google 连通性", "https://www.google.com/generate_204"),
+    ]
+    results = [connectivity_probe(name, url) for name, url in targets]
+    return {
+        "ok": all(item["ok"] for item in results[:2]),
+        "results": results,
+        "required": ["GitHub 更新列表", "GitHub 版本文件"],
+        "optional": ["GitHub 主页", "Google 连通性"],
     }
 
 def update_allowed_file(path: str) -> bool:
@@ -5558,11 +5612,12 @@ async def get_canvas(canvas_id: str):
 @app.get("/api/smart-canvas/prompt-templates")
 async def smart_canvas_prompt_templates():
     try:
-        if not os.path.exists(PROMPT_TEMPLATE_MD):
+        template_path = prompt_template_markdown_path()
+        if not template_path:
             return {"templates": []}
-        with open(PROMPT_TEMPLATE_MD, "r", encoding="utf-8") as f:
+        with open(template_path, "r", encoding="utf-8") as f:
             text = f.read()
-        return {"templates": parse_prompt_template_markdown(text)}
+        return {"templates": parse_prompt_template_markdown(text), "source": os.path.relpath(template_path, BASE_DIR).replace("\\", "/")}
     except Exception as e:
         print(f"读取提示词模板失败: {e}")
         return {"templates": []}
