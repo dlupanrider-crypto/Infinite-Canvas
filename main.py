@@ -15,6 +15,7 @@ import subprocess
 import time
 import traceback
 import shutil
+import glob
 import asyncio
 import logging
 import requests
@@ -301,8 +302,8 @@ JIMENG_DEFAULT_VIDEO_MODELS = [
 ]
 CODEX_DEFAULT_IMAGE_MODELS = ["$imagegen"]
 CODEX_DEFAULT_CHAT_MODELS = ["gpt-5.5"]
-GEMINI_CLI_DEFAULT_IMAGE_MODELS = ["gemini-2.5-flash-image", "auto", "pro", "flash", "flash-lite"]
-GEMINI_CLI_DEFAULT_CHAT_MODELS = ["auto", "pro", "flash", "flash-lite"]
+GEMINI_CLI_DEFAULT_IMAGE_MODELS = ["auto"]
+GEMINI_CLI_DEFAULT_CHAT_MODELS = ["auto"]
 try:
     CODEX_DEFAULT_TIMEOUT = max(30, min(3600, int(os.getenv("CODEX_CLI_TIMEOUT", "900"))))
 except Exception:
@@ -841,7 +842,7 @@ def merge_default_api_providers(providers):
             *[item for item in (current.get("video_models") or []) if str(item or "").strip() not in JIMENG_LEGACY_VIDEO_MODELS],
             *JIMENG_DEFAULT_VIDEO_MODELS,
         ])
-    # OpenAI/Gemini CLI 和即梦一样作为协议使用：用户选中 CLI 协议时再规范化模型与地址，不强制额外注入平台。
+    # OpenAI/Antigravity CLI 和即梦一样作为协议使用：用户选中 CLI 协议时再规范化模型与地址，不强制额外注入平台。
     for current in merged:
         current_protocol = str((current or {}).get("protocol") or "").strip().lower()
         if current_protocol not in {"codex", "gemini-cli"}:
@@ -3404,7 +3405,7 @@ def resolve_chat_provider(provider: str, model: str, ms_model: str):
     if is_codex_provider(api_provider):
         raise HTTPException(status_code=400, detail="OpenAI CLI 使用本机 codex 登录态，不需要 API Key。请使用画布/聊天里的 OpenAI CLI 专用通道。")
     if is_gemini_cli_provider(api_provider):
-        raise HTTPException(status_code=400, detail="Gemini CLI 使用本机 gemini 登录态，不需要 API Key。请使用画布/聊天里的 Gemini CLI 专用通道。")
+        raise HTTPException(status_code=400, detail="Antigravity CLI 使用本机 agy 登录态，不需要 API Key。请使用画布/聊天里的 Antigravity CLI 专用通道。")
     base_root = (api_provider.get("base_url") or AI_BASE_URL).rstrip("/")
     if not base_root:
         raise HTTPException(status_code=400, detail=f"{api_provider.get('name') or api_provider['id']} 未配置 Base URL")
@@ -4393,17 +4394,50 @@ async def codex_chat_text(payload, history_messages=None):
 def gemini_cli_env_value(key):
     return os.getenv(key, "") or read_api_env_value(key)
 
+def antigravity_cli_winget_candidates():
+    patterns = [
+        os.path.join(os.path.expanduser("~"), "AppData", "Local", "Microsoft", "WinGet", "Packages", "Google.AntigravityCLI_*", "agy.exe"),
+        os.path.join(os.getenv("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Packages", "Google.AntigravityCLI_*", "agy.exe"),
+    ]
+    candidates = []
+    for pattern in patterns:
+        if not pattern:
+            continue
+        candidates.extend(glob.glob(pattern))
+    return sorted(dict.fromkeys(path for path in candidates if os.path.exists(path)), reverse=True)
+
 def gemini_cli_executable():
-    configured = str(gemini_cli_env_value("GEMINI_BIN") or "").strip()
-    if configured:
-        return configured
+    for key in ("ANTIGRAVITY_BIN", "AGY_BIN", "GEMINI_BIN"):
+        configured = str(gemini_cli_env_value(key) or "").strip().strip('"')
+        if configured:
+            return configured
+    for name in ("agy", "agy.exe"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for candidate in antigravity_cli_winget_candidates():
+        return candidate
     return shutil.which("gemini") or shutil.which("gemini.exe") or shutil.which("gemini.cmd") or ""
+
+def is_antigravity_cli(exe):
+    text = str(exe or "").lower()
+    return os.path.basename(text).startswith("agy") or "antigravity" in text
+
+def gemini_cli_display_name(exe=None):
+    return "Antigravity CLI" if is_antigravity_cli(exe or gemini_cli_executable()) else "Gemini CLI"
 
 def gemini_cli_timeout(default=GEMINI_CLI_DEFAULT_TIMEOUT):
     try:
         return max(30, min(3600, int(os.getenv("GEMINI_CLI_TIMEOUT", str(default)) or default)))
     except Exception:
         return default
+
+def gemini_cli_image_timeout():
+    raw = os.getenv("ANTIGRAVITY_IMAGE_TIMEOUT") or os.getenv("GEMINI_CLI_IMAGE_TIMEOUT") or "300"
+    try:
+        return max(60, min(1800, int(raw)))
+    except Exception:
+        return 300
 
 def gemini_cli_model(model="", fallback=""):
     value = str(model or fallback or "").strip()
@@ -4453,18 +4487,29 @@ def gemini_cli_parse_stdout(out_text):
 async def run_gemini_cli(prompt, model="", timeout=None, allow_tools=False):
     exe = gemini_cli_executable()
     if not exe:
-        raise HTTPException(status_code=400, detail="未找到 Gemini CLI。请先运行 CLI/windows/gemini/1-install_gemini_cli.bat，并完成 gemini 登录。")
-    args = [
-        exe,
-        "--model",
-        gemini_cli_model(model),
-        "--output-format",
-        "json",
-        "--skip-trust",
-    ]
-    if allow_tools:
-        args.extend(["--approval-mode", "yolo"])
-    args.extend(["--prompt", str(prompt or "")])
+        raise HTTPException(status_code=400, detail="未找到 Antigravity CLI。请先安装 Google Antigravity CLI，并完成 agy 登录。")
+    timeout_seconds = timeout or gemini_cli_timeout()
+    if is_antigravity_cli(exe):
+        args = [exe, "--print-timeout", f"{int(timeout_seconds)}s"]
+        selected = gemini_cli_model(model)
+        if selected and selected != "auto":
+            args.extend(["--model", selected])
+        if allow_tools:
+            args.append("--dangerously-skip-permissions")
+        args.extend(["-p", str(prompt or "")])
+    else:
+        args = [
+            exe,
+            "--model",
+            gemini_cli_model(model),
+            "--output-format",
+            "json",
+            "--skip-trust",
+        ]
+        if allow_tools:
+            args.extend(["--approval-mode", "yolo"])
+        args.extend(["--prompt", str(prompt or "")])
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -4472,16 +4517,22 @@ async def run_gemini_cli(prompt, model="", timeout=None, allow_tools=False):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout or gemini_cli_timeout())
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
     except asyncio.TimeoutError as exc:
-        raise HTTPException(status_code=504, detail="Gemini CLI 执行超时。可设置 GEMINI_CLI_TIMEOUT 增大等待时间。") from exc
+        if proc and proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        raise HTTPException(status_code=504, detail=f"{gemini_cli_display_name(exe)} 执行超时。可设置 GEMINI_CLI_TIMEOUT 增大等待时间。") from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=400, detail=f"未找到 Gemini CLI：{exe}") from exc
+        raise HTTPException(status_code=400, detail=f"未找到 {gemini_cli_display_name(exe)}：{exe}") from exc
     out_text, err_text = codex_decode_output(stdout, stderr)
     raw, text = gemini_cli_parse_stdout(out_text)
     if proc.returncode != 0:
         message = err_text or out_text or f"exit={proc.returncode}"
-        raise HTTPException(status_code=502, detail=f"Gemini CLI 调用失败：{message[:1200]}")
+        raise HTTPException(status_code=502, detail=f"{gemini_cli_display_name(exe)} 调用失败：{message[:1200]}")
     return {"text": text or out_text, "raw": raw, "_stdout": out_text, "_stderr": err_text}
 
 def gemini_cli_models_payload(raw=None):
@@ -4491,7 +4542,7 @@ def gemini_cli_models_payload(raw=None):
         "ok": True,
         "protocol": "gemini-cli",
         "status": 200,
-        "message": "Gemini CLI 可用，模型列表来自 Gemini CLI 常用别名与图片测试模型。",
+        "message": "Antigravity CLI 可用，模型列表使用 auto 默认模型。",
         "model_count": len(all_models),
         "total": len(all_models),
         "image_models": GEMINI_CLI_DEFAULT_IMAGE_MODELS,
@@ -4514,6 +4565,25 @@ def gemini_cli_reference_note(reference_images=None):
 async def gemini_cli_reference_paths(reference_images=None):
     return await codex_reference_paths(reference_images)
 
+def gemini_cli_image_size_instruction(size="", model=""):
+    size_text = str(size or "").strip()
+    model_text = str(model or "").strip()
+    match = re.match(r"^\s*(\d{2,5})\s*[xX*]\s*(\d{2,5})\s*$", size_text)
+    if match:
+        width, height = int(match.group(1)), int(match.group(2))
+        if width > 0 and height > 0:
+            orientation = "正方形" if width == height else ("横版" if width > height else "竖版")
+            return (
+                f"目标输出分辨率：{width}x{height} 像素（宽 x 高），画面方向：{orientation}。"
+                "请尽量直接生成这个像素尺寸或最接近的高分辨率图片，不要默认降到 1024x1024。"
+            )
+    combined = f"{size_text} {model_text}".lower()
+    if "4k" in combined:
+        return "目标输出为 4K 高分辨率图片，长边至少 4096 像素；不要默认输出 1024px 小图。"
+    if "2k" in combined:
+        return "目标输出为 2K 高分辨率图片，长边至少 2048 像素；不要默认输出 1024px 小图。"
+    return f"尺寸/比例参考：{size_text or 'auto'}。如果可以指定分辨率，请优先输出高分辨率图片。"
+
 async def generate_gemini_cli_provider_image(prompt, size, model, reference_images=None, provider=None):
     ref_paths, temp_paths = await gemini_cli_reference_paths(reference_images)
     since = time.time()
@@ -4521,18 +4591,20 @@ async def generate_gemini_cli_provider_image(prompt, size, model, reference_imag
         ref_text = ""
         if ref_paths:
             ref_text = "\n参考图片本地路径：\n" + "\n".join(ref_paths)
+        size_context = f"{model or ''} {prompt or ''}"
         image_prompt = (
             f"你正在为 Infinite Canvas 生成图片。\n"
             f"任务：{prompt}\n\n"
-            f"尺寸/比例参考：{size or 'auto'}。\n"
+            f"{gemini_cli_image_size_instruction(size, size_context)}\n"
             f"{ref_text}\n\n"
-            f"如果当前 Gemini CLI/模型支持图片生成或图片编辑，请把最终图片保存到这个本地目录：{OUTPUT_OUTPUT_DIR}\n"
-            "文件格式优先 png 或 jpg。只输出最终文件路径和一句简短说明；不要修改项目代码，不要创建额外文档。"
+            f"如果当前 Antigravity CLI/模型支持图片生成或图片编辑，请把最终图片保存到这个本地目录：{OUTPUT_OUTPUT_DIR}\n"
+            "文件格式优先 png 或 jpg。只输出最终文件路径和一句简短说明；不要修改项目代码，不要创建额外文档。\n"
+            "如果你无法真正创建图片文件，请在 60 秒内直接回复“无法生成图片文件”，不要只写计划，也不要持续尝试。"
         )
         raw = await run_gemini_cli(
             image_prompt,
             model=model or GEMINI_CLI_DEFAULT_IMAGE_MODELS[0],
-            timeout=gemini_cli_timeout(),
+            timeout=gemini_cli_image_timeout() if is_antigravity_cli(gemini_cli_executable()) else gemini_cli_timeout(),
             allow_tools=True,
         )
         files = codex_output_image_files(since)
@@ -4550,7 +4622,7 @@ async def generate_gemini_cli_provider_image(prompt, size, model, reference_imag
                     urls.append(url)
         if not urls:
             status_text = (raw.get("text") or raw.get("_stdout") or raw.get("_stderr") or "")[:1200]
-            raise HTTPException(status_code=502, detail=f"Gemini CLI 已返回，但没有在输出目录发现图片：{status_text}")
+            raise HTTPException(status_code=502, detail=f"{gemini_cli_display_name()} 已返回，但没有在输出目录发现图片：{status_text}")
         return {"type": "url", "value": urls[0]}, {"images": urls, "text": raw.get("text"), "provider": "gemini-cli", "raw": raw.get("raw")}
     finally:
         for path in temp_paths:
@@ -4596,7 +4668,7 @@ async def gemini_cli_chat_text(payload, history_messages=None):
             allow_tools=False,
         )
         text = str(raw.get("text") or "").strip()
-        return text or "Gemini CLI 返回了空回复。", raw
+        return text or f"{gemini_cli_display_name()} 返回了空回复。", raw
     finally:
         for path in temp_paths:
             try:
@@ -11106,11 +11178,13 @@ async def codex_help(payload: CodexHelpRequest):
 @app.get("/api/gemini-cli/status")
 async def gemini_cli_status():
     exe = gemini_cli_executable()
+    display_name = gemini_cli_display_name(exe)
     if not exe:
         return {
             "installed": False,
             "logged_in": False,
-            "message": "未找到 Gemini CLI，请先安装。",
+            "provider": "antigravity",
+            "message": "未找到 Antigravity CLI，请先安装。",
         }
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -11123,12 +11197,14 @@ async def gemini_cli_status():
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
         out_text, err_text = codex_decode_output(stdout, stderr)
         ok = proc.returncode == 0
+        is_agy = is_antigravity_cli(exe)
         return {
             "installed": ok,
             "logged_in": None,
             "version": out_text or err_text,
             "path": exe,
-            "message": "Gemini CLI 已安装。登录状态会在首次执行 gemini 时由 CLI 校验。" if ok else (err_text or out_text or "Gemini CLI 检测失败"),
+            "provider": "antigravity" if is_agy else "gemini",
+            "message": f"{display_name} 已安装。登录状态会在首次执行 {'agy' if is_agy else 'gemini'} 时由 CLI 校验。" if ok else (err_text or out_text or f"{display_name} 检测失败"),
             "raw": {"stdout": out_text, "stderr": err_text, "returncode": proc.returncode},
         }
     except Exception as exc:
@@ -11136,18 +11212,20 @@ async def gemini_cli_status():
             "installed": False,
             "logged_in": False,
             "path": exe,
-            "message": f"Gemini CLI 检测失败：{exc}",
+            "provider": "antigravity" if is_antigravity_cli(exe) else "gemini",
+            "message": f"{display_name} 检测失败：{exc}",
         }
 
 @app.post("/api/gemini-cli/help")
 async def gemini_cli_help(payload: GeminiCliHelpRequest):
     exe = gemini_cli_executable()
     if not exe:
-        raise HTTPException(status_code=400, detail="未找到 Gemini CLI。")
-    allowed = {"", "help", "mcp", "extensions"}
+        raise HTTPException(status_code=400, detail="未找到 Antigravity CLI。")
+    is_agy = is_antigravity_cli(exe)
+    allowed = {"", "help", "install", "models", "plugin", "plugins", "update", "changelog"} if is_agy else {"", "help", "mcp", "extensions"}
     command = str(payload.command or "").strip()
     if command not in allowed:
-        raise HTTPException(status_code=400, detail="不允许的 Gemini CLI 命令")
+        raise HTTPException(status_code=400, detail=f"不允许的 {gemini_cli_display_name(exe)} 命令")
     args = [exe]
     if command:
         args.append(command)
@@ -11655,7 +11733,7 @@ async def test_provider_connection(payload: TestConnectionPayload):
         payload_models.update({
             "ok": bool(status.get("installed")),
             "status": 200 if status.get("installed") else 0,
-            "message": status.get("message") or ("Gemini CLI 可用" if status.get("installed") else "未找到 Gemini CLI"),
+            "message": status.get("message") or ("Antigravity CLI 可用" if status.get("installed") else "未找到 Antigravity CLI"),
         })
         return payload_models
     if protocol == "jimeng":
@@ -11769,7 +11847,7 @@ async def probe_async_endpoint(payload: TestConnectionPayload):
             "ok": bool(status.get("installed")),
             "protocol": "gemini-cli",
             "status_code": 200 if status.get("installed") else 0,
-            "message": status.get("message") or "Gemini CLI 本机检测完成",
+            "message": status.get("message") or "Antigravity CLI 本机检测完成",
             "raw": status,
         }
     if not base_url:
