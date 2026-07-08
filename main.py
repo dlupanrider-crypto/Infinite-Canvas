@@ -38,6 +38,17 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
+from app_services.static_versioning import (
+    configure_static_versioning,
+    current_app_version,
+    fetch_remote_update_notes,
+    fetch_update_notes_with_fallback,
+    read_local_update_notes,
+    safe_update_notes,
+    static_html_response,
+    sync_static_html_versions,
+    versioned_static_html,
+)
 
 QUIET_ACCESS_PATHS = {
     "/api/queue_status",
@@ -162,7 +173,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.06.03"
+APP_VERSION = "2026.07.6"
 GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
 GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
@@ -223,6 +234,12 @@ STATIC_RUNNINGHUB_DIR = os.path.join(STATIC_DIR, "runninghub")
 STATIC_RUNNINGHUB_THUMBNAIL_DIR = os.path.join(STATIC_RUNNINGHUB_DIR, "thumbnails")
 STATIC_RUNNINGHUB_API_PROVIDERS_FILE = os.path.join(STATIC_RUNNINGHUB_DIR, "api_providers.json")
 STATIC_RUNNINGHUB_MODEL_REGISTRY_FILE = os.path.join(STATIC_RUNNINGHUB_DIR, "models_registry.json")
+configure_static_versioning(
+    base_dir=BASE_DIR,
+    static_dir=STATIC_DIR,
+    github_update_notes_url=GITHUB_UPDATE_NOTES_URL,
+    modelscope_update_notes_url=MODELSCOPE_UPDATE_NOTES_URL,
+)
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 OUTPUT_INPUT_DIR = os.path.join(ASSETS_DIR, "input")
@@ -1416,71 +1433,7 @@ app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
 
 # --- Pydantic 模型 ---
 
-def current_app_version():
-    version_file = os.path.join(BASE_DIR, "VERSION")
-    try:
-        if os.path.exists(version_file):
-            with open(version_file, "r", encoding="utf-8") as f:
-                version = (f.read().strip().splitlines() or [""])[0].strip()
-                if version:
-                    return version
-    except Exception:
-        pass
-    try:
-        return time.strftime("%Y.%m.%d", time.localtime())
-    except Exception:
-        return ""
-
-def update_notes_path() -> str:
-    return os.path.join(STATIC_DIR, "update-notes.json")
-
-def safe_update_notes(payload: Any, version: str = "") -> Dict[str, Any]:
-    if not isinstance(payload, dict):
-        return {}
-    items = payload.get("items")
-    if not isinstance(items, list):
-        items = []
-    clean_items = []
-    for item in items[:30]:
-        if isinstance(item, dict):
-            text = str(item.get("text") or item.get("title") or "").strip()
-            if not text:
-                continue
-            clean_items.append({
-                "type": str(item.get("type") or "update").strip()[:32],
-                "text": text[:500],
-            })
-        else:
-            text = str(item or "").strip()
-            if text:
-                clean_items.append({"type": "update", "text": text[:500]})
-    notes_version = str(payload.get("version") or version or "").strip()
-    history = payload.get("history")
-    selected_history = {}
-    if version and isinstance(history, list):
-        for entry in history:
-            if isinstance(entry, dict) and str(entry.get("version") or "").strip() == version:
-                selected_history = safe_update_notes(entry, version)
-                break
-    if selected_history:
-        return selected_history
-    return {
-        "version": notes_version,
-        "updated_at": str(payload.get("updated_at") or payload.get("date") or "").strip(),
-        "items": clean_items,
-    }
-
-def read_local_update_notes(version: str = "") -> Dict[str, Any]:
-    try:
-        path = update_notes_path()
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return safe_update_notes(json.load(f), version)
-    except Exception:
-        pass
-    return {"version": version or current_app_version(), "updated_at": "", "items": []}
-
-def fetch_remote_update_notes(url: str, version: str = "", timeout: float = 5.0) -> Dict[str, Any]:
+def _legacy_fetch_remote_update_notes(url: str, version: str = "", timeout: float = 5.0) -> Dict[str, Any]:
     info: Dict[str, Any] = {"ok": False, "error": "", "url": url, "version": version, "items": []}
     if not url:
         info["error"] = "missing url"
@@ -1503,7 +1456,7 @@ def fetch_remote_update_notes(url: str, version: str = "", timeout: float = 5.0)
         info["error"] = str(exc)
     return info
 
-def fetch_update_notes_with_fallback(preferred_source: str, version: str, timeout: float = 3.0) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _legacy_fetch_update_notes_with_fallback(preferred_source: str, version: str, timeout: float = 3.0) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     urls = {
         "github": GITHUB_UPDATE_NOTES_URL,
         "modelscope": MODELSCOPE_UPDATE_NOTES_URL,
@@ -1531,7 +1484,7 @@ def fetch_update_notes_with_fallback(preferred_source: str, version: str, timeou
             }
     return best_notes, notes_by_source
 
-def versioned_static_html(html: str) -> str:
+def _legacy_versioned_static_html(html: str) -> str:
     version = current_app_version()
     if not version:
         return html
@@ -1551,7 +1504,7 @@ def versioned_static_html(html: str) -> str:
         return f"{match.group('prefix')}{url}?v={cache_version}"
     return pattern.sub(replace, html)
 
-def sync_static_html_versions():
+def _legacy_sync_static_html_versions():
     version = current_app_version()
     if not version:
         return
@@ -1580,7 +1533,7 @@ def sync_static_html_versions():
     except Exception as e:
         print(f"同步静态页面版本号失败: {e}")
 
-def static_html_response(filename: str):
+def _legacy_static_html_response(filename: str):
     path = os.path.join(STATIC_DIR, filename)
     with open(path, "r", encoding="utf-8") as f:
         html = f.read()
